@@ -33,8 +33,12 @@ import io.netty.util.AttributeKey;
 
 import java.net.InetSocketAddress;
 import java.nio.channels.ClosedChannelException;
+import java.util.ArrayDeque;
+import java.util.Queue;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
+import io.netty.util.ReferenceCountUtil;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Ignore;
@@ -463,6 +467,7 @@ public class Http2MultiplexCodecTest {
         childChannel.close(p).syncUninterruptibly();
 
         assertFalse(channelOpen.get());
+        assertFalse(channelActive.get());
         assertFalse(childChannel.isActive());
     }
 
@@ -487,6 +492,46 @@ public class Http2MultiplexCodecTest {
         childChannel.close().syncUninterruptibly();
 
         assertFalse(channelOpen.get());
+        assertFalse(channelActive.get());
+        assertFalse(childChannel.isActive());
+    }
+
+    @Test
+    public void channelClosedWhenWriteFutureFails() {
+        final Queue<ChannelPromise> writePromises = new ArrayDeque<ChannelPromise>();
+        writer = new Writer() {
+            @Override
+            void write(Object msg, ChannelPromise promise) {
+                ReferenceCountUtil.release(msg);
+                writePromises.offer(promise);
+            }
+        };
+
+        LastInboundHandler inboundHandler = streamActiveAndWriteHeaders(inboundStream);
+        Http2StreamChannel childChannel = (Http2StreamChannel) inboundHandler.channel();
+
+        assertTrue(childChannel.isOpen());
+        assertTrue(childChannel.isActive());
+
+        final AtomicBoolean channelOpen = new AtomicBoolean(true);
+        final AtomicBoolean channelActive = new AtomicBoolean(true);
+
+        ChannelFuture f = childChannel.writeAndFlush(new DefaultHttp2HeadersFrame(new DefaultHttp2Headers()));
+        assertFalse(f.isDone());
+        f.addListener(new ChannelFutureListener() {
+            @Override
+            public void operationComplete(ChannelFuture future) throws Exception {
+                channelOpen.set(future.channel().isOpen());
+                channelActive.set(future.channel().isActive());
+            }
+        });
+
+        ChannelPromise first = writePromises.poll();
+        first.setFailure(new ClosedChannelException());
+        f.awaitUninterruptibly();
+
+        assertFalse(channelOpen.get());
+        assertFalse(channelActive.get());
         assertFalse(childChannel.isActive());
     }
 
@@ -581,6 +626,54 @@ public class Http2MultiplexCodecTest {
         childChannel.close().syncUninterruptibly();
         assertFalse(channelOpen.get());
         assertFalse(channelActive.get());
+    }
+
+    @Test
+    public void channelInactiveHappensAfterExceptionCaughtEvents() throws Exception {
+        final AtomicInteger count = new AtomicInteger(0);
+        final AtomicInteger exceptionCaught = new AtomicInteger(-1);
+        final AtomicInteger channelInactive = new AtomicInteger(-1);
+        final AtomicInteger channelUnregistered = new AtomicInteger(-1);
+        Http2StreamChannel childChannel = newOutboundStream();
+
+        childChannel.pipeline().addLast(new ChannelInboundHandlerAdapter() {
+
+            @Override
+            public void userEventTriggered(ChannelHandlerContext ctx, Object evt) throws Exception {
+                ctx.close();
+                throw new Exception("exception");
+            }
+        });
+
+        childChannel.pipeline().addLast(new ChannelInboundHandlerAdapter() {
+
+            @Override
+            public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+                channelInactive.set(count.getAndIncrement());
+                super.channelInactive(ctx);
+            }
+
+            @Override
+            public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+                exceptionCaught.set(count.getAndIncrement());
+                super.exceptionCaught(ctx, cause);
+            }
+
+            @Override
+            public void channelUnregistered(ChannelHandlerContext ctx) throws Exception {
+                channelUnregistered.set(count.getAndIncrement());
+                super.channelUnregistered(ctx);
+            }
+        });
+
+        childChannel.pipeline().fireUserEventTriggered(new Object());
+        parentChannel.runPendingTasks();
+
+        // The events should have happened in this order because the inactive and deregistration events
+        // get deferred as they do in the AbstractChannel.
+        assertEquals(0, exceptionCaught.get());
+        assertEquals(1, channelInactive.get());
+        assertEquals(2, channelUnregistered.get());
     }
 
     @Ignore("not supported anymore atm")
